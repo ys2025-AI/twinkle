@@ -10,12 +10,12 @@
 |------|---------|------|
 | Python | >= 3.11, < 3.13 | Twinkle 框架要求 |
 | 昇腾固件驱动（HDK） | 推荐最新版本 | 硬件驱动和固件 |
-| CANN 工具包 | 8.5.1 或更高 | 异构计算架构 |
-| PyTorch | 2.7.1 | 深度学习框架 |
-| torch_npu | 2.7.1 | 昇腾 PyTorch 适配插件 |
+| CANN 工具包 | 9.2.0 或更高 | 异构计算架构 |
+| PyTorch | 2.10.0 | 深度学习框架 |
+| torch_npu | 2.10.0 | 昇腾 PyTorch 适配插件 |
 
 **重要说明**：
-- torch 和 torch_npu 版本**必须完全一致**（例如都为 2.7.1）
+- torch 和 torch_npu 版本**必须完全一致**（例如都为 2.10.0）
 - 推荐使用 Python 3.11 以获得最佳兼容性
 - CANN 工具包需要约 10GB+ 磁盘空间
 
@@ -42,9 +42,9 @@ NPU 环境的安装包括昇腾驱动、CANN 工具包、PyTorch 和 torch_npu�
 
 **推荐版本配置**：
 - Python: 3.11
-- PyTorch: 2.7.1
-- torch_npu: 2.7.1
-- CANN: 8.5.1 或更高
+- PyTorch: 2.10.0
+- torch_npu: 2.10.0
+- CANN: 9.2.0 或更高
 
 ### 2. 安装 Twinkle
 
@@ -64,16 +64,16 @@ pip install -e ".[transformers,ray]"
 
 ```bash
 # 第一步：安装 vLLM
-pip install vllm==0.14.0
+pip install vllm==0.30.0
 
 # 第二步：安装 vLLM-Ascend
-pip install vllm-ascend==0.14.0rc1
+pip install vllm-ascend==0.30.0rc2
 ```
 
 **注意事项**：
 - 按照上述顺序安装，忽略可能的依赖冲突提示
 - 安装前确保已激活 CANN 环境：`source /usr/local/Ascend/ascend-toolkit/set_env.sh`
-- 推荐使用的版本为 vLLM 0.14.0 和 vLLM-Ascend 0.14.0rc1
+- 推荐使用的版本为 vLLM 0.30.0 和 vLLM-Ascend 0.30.0rc2（配套 torch/torch_npu 2.10.0、CANN 9.2.0、triton-ascend 3.2.2）
 
 ### 4. 验证安装
 
@@ -179,6 +179,7 @@ Twinkle 将 Qwen3.5 FLA 直接委托给 fla 原生算子（`fla.modules.convolut
 | --- | --- | --- |
 | 3.2.0 | 8.5.x | 不需要安装 `triton` |
 | 3.2.1 | 9.0.0 | 需要安装 `triton` |
+| 3.2.2 | 9.2.0 | 需要安装 `triton` |
 
 > **注意**：如环境中安装了多个 fla 版本（例如旧的常规安装遮蔽了 editable 安装），请确保带 `triton_ascend` 后端的版本（>= 0.5.2）优先加载。可通过以下命令验证：
 > ```python
@@ -261,8 +262,8 @@ python -c "import torch; import torch_npu; print(torch.__version__, torch_npu.__
 
 # 重新安装匹配版本
 pip uninstall torch torch_npu -y
-pip install torch==2.7.1
-pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
+pip install torch==2.10.0
+pip install torch_npu==2.10.0.post4
 ```
 
 ### 2. CANN 工具包版本问题

@@ -10,12 +10,12 @@ Before getting started, please ensure your system meets the following requiremen
 |------------------------------|----------------------------|--------------------------------------|
 | Python                       | >= 3.11, < 3.13            | Twinkle framework requirement        |
 | Ascend Firmware Driver (HDK) | Latest version recommended | Hardware driver and firmware         |
-| CANN Toolkit                 | 8.5.1 or higher            | Heterogeneous Computing Architecture |
-| PyTorch                      | 2.7.1                      | Deep learning framework              |
-| torch_npu                    | 2.7.1                      | Ascend PyTorch adapter plugin        |
+| CANN Toolkit                 | 9.2.0 or higher            | Heterogeneous Computing Architecture |
+| PyTorch                      | 2.10.0                     | Deep learning framework              |
+| torch_npu                    | 2.10.0                     | Ascend PyTorch adapter plugin        |
 
 **Important Notes**:
-- torch and torch_npu versions **must be exactly the same** (e.g., both 2.7.1)
+- torch and torch_npu versions **must be exactly the same** (e.g., both 2.10.0)
 - Python 3.11 is recommended for best compatibility
 - CANN toolkit requires approximately 10GB+ disk space
 
@@ -42,9 +42,9 @@ This documentation includes:
 
 **Recommended Version Configuration**:
 - Python: 3.11
-- PyTorch: 2.7.1
-- torch_npu: 2.7.1
-- CANN: 8.5.1 or higher
+- PyTorch: 2.10.0
+- torch_npu: 2.10.0
+- CANN: 9.2.0 or higher
 
 ### 2. Install Twinkle
 
@@ -64,16 +64,16 @@ If you need to use vLLMSampler for efficient inference, you can install vLLM and
 
 ```bash
 # Step 1: Install vLLM
-pip install vllm==0.14.0
+pip install vllm==0.30.0
 
 # Step 2: Install vLLM-Ascend
-pip install vllm-ascend==0.14.0rc1
+pip install vllm-ascend==0.30.0rc2
 ```
 
 **Notes**:
 - Install in the above order, ignoring possible dependency conflict warnings
 - Ensure CANN environment is activated before installation: `source /usr/local/Ascend/ascend-toolkit/set_env.sh`
-- Recommended versions are vLLM 0.14.0 and vLLM-Ascend 0.14.0rc1
+- Recommended versions are vLLM 0.30.0 and vLLM-Ascend 0.30.0rc2 (paired with torch/torch_npu 2.10.0, CANN 9.2.0, triton-ascend 3.2.2)
 
 ### 4. Verify Installation
 
@@ -180,6 +180,7 @@ Twinkle delegates Qwen3.5 FLA to fla's native operators (`fla.modules.convolutio
 | --- | --- | --- |
 | 3.2.0 | 8.5.x | Do not install `triton` |
 | 3.2.1 | 9.0.0 | `triton` must be installed |
+| 3.2.2 | 9.2.0 | `triton` must be installed |
 
 > **Note:** If multiple fla versions are installed (e.g., a stale regular install shadowing the editable install), ensure the fla version with the `triton_ascend` backend (>= 0.5.2) takes precedence. You can verify with:
 > ```python
@@ -262,8 +263,8 @@ python -c "import torch; import torch_npu; print(torch.__version__, torch_npu.__
 
 # Reinstall matching versions
 pip uninstall torch torch_npu -y
-pip install torch==2.7.1
-pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
+pip install torch==2.10.0
+pip install torch_npu==2.10.0.post4
 ```
 
 ### 2. CANN Toolkit Version Issue

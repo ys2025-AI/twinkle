@@ -1,3 +1,4 @@
+import inspect
 import socket
 from dataclasses import dataclass
 from datetime import timedelta
@@ -7,6 +8,27 @@ from .network import is_valid_ipv6_address
 
 if TYPE_CHECKING:
     import torch
+
+
+def vllm_base_layer_suffix_required() -> bool:
+    """Whether base-model weight sync must use vLLM's ``.base_layer.`` param path.
+
+    vLLM <= 0.29 exposed LoRA-wrapped base layers exclusively as
+    ``<module>.base_layer.weight``.  vLLM >= 0.30's ``BaseLayerWithLoRA.load_weights``
+    forwards to ``AutoWeightsLoader(self.base_layer)``, so the canonical
+    ``<module>.weight`` name is expected instead; sending ``.base_layer.`` makes the
+    loader look for a non-existent ``base_layer`` submodule and fail.
+    """
+    try:
+        from importlib.metadata import version
+        from packaging.version import Version
+
+        # Compare major.minor only so pre-releases such as 0.30.0rc1 are treated
+        # as >= 0.30 (``Version('0.30.0rc1') < Version('0.30')`` is True).
+        return Version(version('vllm')).release[:2] < (0, 30)
+    except Exception:
+        # Preserve the historical behavior when the version cannot be determined.
+        return True
 
 
 def to_device(data: Any, device: Union[str, 'torch.device', int], non_blocking: bool = False) -> Any:
@@ -355,40 +377,51 @@ def stateless_init_process_group(
     if device is None:
         device = torch.cuda.current_device() if backend == 'nccl' else torch.npu.current_device()
 
-    # Create the stateless process group
+    # Create the stateless process group.
     launch_server = rank == 0
+    # vLLM >= 0.30 dropped the ``socket`` field from StatelessProcessGroup
+    # (metadata exchange now goes exclusively through the store), which means
+    # nothing keeps a caller-created listen socket alive once this function
+    # returns. If we still handed its fd to TCPStore as ``master_listen_fd``,
+    # the GC would close the socket and the store daemon would abort with
+    # POLLNVAL. So only pre-create the socket for older vLLM that declares it.
+    supports_socket = 'socket' in inspect.signature(StatelessProcessGroup).parameters
 
-    if launch_server and listen_socket is None:
-        # For master, create a listening socket if not provided
-        if is_valid_ipv6_address(master_address):
-            listen_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        else:
-            listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listen_socket.bind((master_address, master_port))
-        listen_socket.listen()
-        listen_fd = listen_socket.fileno()
-    elif launch_server and listen_fd is None:
-        listen_fd = listen_socket.fileno()
+    if supports_socket:
+        if launch_server and listen_socket is None:
+            # For master, create a listening socket if not provided
+            if is_valid_ipv6_address(master_address):
+                listen_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            else:
+                listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listen_socket.bind((master_address, master_port))
+            listen_socket.listen()
+            listen_fd = listen_socket.fileno()
+        elif launch_server and listen_fd is None:
+            listen_fd = listen_socket.fileno()
 
-    store = TCPStore(
+    store_kwargs = dict(
         host_name=master_address,
         port=master_port,
         world_size=world_size,
         is_master=launch_server,
         timeout=timedelta(seconds=300),
         use_libuv=False,  # for compatibility
-        master_listen_fd=listen_fd,
     )
+    if supports_socket and listen_fd is not None:
+        store_kwargs['master_listen_fd'] = listen_fd
+    store = TCPStore(**store_kwargs)
 
-    pg = StatelessProcessGroup(
+    pg_kwargs = dict(
         rank=rank,
         world_size=world_size,
         store=store,
-        socket=listen_socket,
         data_expiration_seconds=3600,
     )
-
+    if supports_socket:
+        pg_kwargs['socket'] = listen_socket
+    pg = StatelessProcessGroup(**pg_kwargs)
     communicator = Communicator(pg, device=device)
     return communicator
 

@@ -11,7 +11,7 @@ from typing import List, Tuple, Dict, Any
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.cli import CLI
@@ -32,6 +32,20 @@ args = CLI.from_args()
 # ========== Configuration ==========
 MODEL_ID = args.model.model_id or 'ms://Qwen/Qwen3.5-4B'
 USE_MEGATRON = args.model.strategy != 'native_fsdp'
+
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
+
+GSM8K_DATASET_ID = args.dataset.dataset_id or 'ms://modelscope/gsm8k'
+# ``DatasetArgs.subset_name`` defaults to ``'default'``, which cannot distinguish
+# "unset" from an explicit ``'default'``. Resolve GSM8K's subset unambiguously: a
+# dedicated ``--gsm8k-subset`` (or ``TWINKLE_GSM8K_SUBSET``) knob is honored
+# verbatim, then an explicitly non-default ``--dataset-subset-name``, else
+# GSM8K's real subset ``'main'``.
+GSM8K_SUBSET = str(args.get('gsm8k_subset')
+                   or (args.dataset.subset_name if args.dataset.subset_name != 'default' else None) or 'main')
+GSM8K_SPLIT = args.dataset.split or 'train'
 
 MODEL_GPUS = args.infra.model_gpus or 4
 SAMPLER_GPUS = args.infra.sampler_gpus or 4
@@ -89,7 +103,7 @@ class GSM8KBrevityReward(Reward):
 # ========== Dataset ==========
 def create_gsm8k_dataset():
     dataset = Dataset()
-    dataset.add_dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset.add_dataset(DatasetMeta(GSM8K_DATASET_ID, subset_name=GSM8K_SUBSET, split=GSM8K_SPLIT))
     dataset.set_template('Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
@@ -111,8 +125,8 @@ def compute_rewards(
 # ========== Main ==========
 def main():
     device_groups = [
-        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU'),
+        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type=DEVICE_TYPE),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type=DEVICE_TYPE),
     ]
 
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
@@ -141,6 +155,7 @@ def main():
             model_id=MODEL_ID,
             device_mesh=model_mesh,
             remote_group='model',
+            strategy=args.model.strategy,
         )
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)

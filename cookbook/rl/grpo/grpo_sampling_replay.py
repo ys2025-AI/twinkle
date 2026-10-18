@@ -4,7 +4,7 @@ from typing import List, Tuple, Dict, Any
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.cli import CLI
@@ -21,8 +21,22 @@ from twinkle.preprocessor.llm import GSM8KProcessor
 logger = get_logger()
 args = CLI.from_args()
 
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
+
 MODEL_ID = args.model.model_id or 'ms://Qwen/Qwen3.5-4B'
 USE_MEGATRON = args.model.strategy != 'native_fsdp'
+
+GSM8K_DATASET_ID = args.dataset.dataset_id or 'ms://modelscope/gsm8k'
+# ``DatasetArgs.subset_name`` defaults to ``'default'``, which cannot distinguish
+# "unset" from an explicit ``'default'``. Resolve GSM8K's subset unambiguously: a
+# dedicated ``--gsm8k-subset`` (or ``TWINKLE_GSM8K_SUBSET``) knob is honored
+# verbatim, then an explicitly non-default ``--dataset-subset-name``, else
+# GSM8K's real subset ``'main'``.
+GSM8K_SUBSET = str(args.get('gsm8k_subset')
+                   or (args.dataset.subset_name if args.dataset.subset_name != 'default' else None) or 'main')
+GSM8K_SPLIT = args.dataset.split or 'train'
 # This entry point is exclusively for sampling-distribution replay.
 ENABLE_SAMPLING_REPLAY = True
 
@@ -50,7 +64,7 @@ if ENABLE_SAMPLING_REPLAY and USE_MEGATRON:
     raise ValueError('Sampling replay currently requires --strategy native_fsdp')
 
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset = Dataset(DatasetMeta(GSM8K_DATASET_ID, subset_name=GSM8K_SUBSET, split=GSM8K_SPLIT))
     dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=400)
     dataset.map(GSM8KProcessor())
     dataset.encode(add_generation_prompt=True)
@@ -91,13 +105,10 @@ def extract_rollout_batch(sample_responses):
 def main():
     # set sampler and model separate to use different gpus
     device_groups = [
-        DeviceGroup(name='model',ranks=list(range(MODEL_GPUS)),device_type='GPU'),
-        DeviceGroup(name='sampler',ranks=list(range(MODEL_GPUS, NUM_GPUS)),device_type='GPU'),
+        DeviceGroup(name='model',ranks=list(range(MODEL_GPUS)),device_type=DEVICE_TYPE),
+        DeviceGroup(name='sampler',ranks=list(range(MODEL_GPUS, NUM_GPUS)),device_type=DEVICE_TYPE),
     ]
-    if USE_MEGATRON:
-        model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
-    else:
-        model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
+    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
@@ -121,6 +132,7 @@ def main():
             model_cls=Qwen3_5ForConditionalGeneration,
             device_mesh=model_mesh,
             remote_group='model',
+            strategy=args.model.strategy,
         )
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)

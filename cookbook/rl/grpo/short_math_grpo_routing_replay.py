@@ -6,13 +6,14 @@ Supports three routing replay modes for MoE expert routing consistency:
 - R3: vLLM returns routed_experts data (requires vLLM >= 0.14.0), training replays directly
 """
 import copy
+import os
 import re
 from typing import List, Tuple, Dict, Any
 
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.cli import CLI
@@ -35,6 +36,24 @@ args = CLI.from_args()
 MODEL_ID = args.model.model_id or 'ms://Qwen/Qwen3.6-35B-A3B'
 USE_MEGATRON = args.model.strategy != 'native_fsdp'
 ROUTER_REPLAY_MODE = args.rl.router_replay_mode or 'R3'
+
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
+
+# LoRA here targets the 3D fused expert params (PEFT ``target_parameters``), so
+# vLLM must keep its default 3D MoE weight layout.
+os.environ.setdefault('TWINKLE_QWEN35_MOE_IS_3D_WEIGHT', '1')
+
+GSM8K_DATASET_ID = args.dataset.dataset_id or 'ms://modelscope/gsm8k'
+# ``DatasetArgs.subset_name`` defaults to ``'default'``, which cannot distinguish
+# "unset" from an explicit ``'default'``. Resolve GSM8K's subset unambiguously: a
+# dedicated ``--gsm8k-subset`` (or ``TWINKLE_GSM8K_SUBSET``) knob is honored
+# verbatim, then an explicitly non-default ``--dataset-subset-name``, else
+# GSM8K's real subset ``'main'``.
+GSM8K_SUBSET = str(args.get('gsm8k_subset')
+                   or (args.dataset.subset_name if args.dataset.subset_name != 'default' else None) or 'main')
+GSM8K_SPLIT = args.dataset.split or 'train'
 
 MODEL_GPUS = args.infra.model_gpus or 4
 MODEL_FSDP = args.infra.fsdp_size or 4
@@ -109,7 +128,7 @@ class GSM8KBrevityReward(Reward):
 
 # ========== Dataset ==========
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset = Dataset(DatasetMeta(GSM8K_DATASET_ID, subset_name=GSM8K_SUBSET, split=GSM8K_SPLIT))
     dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
@@ -131,8 +150,8 @@ def compute_rewards(
 # ========== Main ==========
 def main():
     device_groups = [
-        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU', gpus_per_worker=SAMPLER_TP),
+        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type=DEVICE_TYPE),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type=DEVICE_TYPE, gpus_per_worker=SAMPLER_TP),
     ]
     if USE_MEGATRON:
         dp_size = MODEL_GPUS //  (MODEL_TP * MODEL_PP)
@@ -199,6 +218,8 @@ def main():
         'tensor_parallel_size': SAMPLER_TP,
         'gpu_memory_utilization': 0.7,
         'max_model_len': 10000,
+        # Ascend exhausts ACL-graph capture resources here; eager avoids it.
+        'enforce_eager': DEVICE_TYPE == 'NPU',
         'max_lora_rank': LORA_RANK,
         'enable_lora': True,
         'enable_tower_connector_lora': True,
@@ -215,6 +236,14 @@ def main():
     sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
+    if DEVICE_TYPE == 'NPU':
+        # The sampler's vLLM engine already loaded the identical base model from
+        # the same checkpoint and the base is frozen under LoRA training, so the
+        # first full base-weight sync is redundant. Skipping it also avoids
+        # vLLM 0.30's fused 3D MoE expert loader (Qwen3.5 ``gate_up_proj`` /
+        # ``down_proj``), which mis-shapes when driven through manual
+        # ``model.load_weights`` under TP. Only the LoRA adapter is synced.
+        ckpt_manager.base_sync_done = True
 
     GLOBAL_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
     dataloader = DataLoader(

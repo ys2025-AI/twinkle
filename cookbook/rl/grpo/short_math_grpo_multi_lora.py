@@ -19,7 +19,7 @@ from typing import List, Tuple, Dict, Any
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.cli import CLI
 from twinkle.data_format import SamplingParams
@@ -36,8 +36,21 @@ from twinkle.preprocessor.llm import GSM8KProcessor
 logger = get_logger()
 args = CLI.from_args()
 
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
+
 # ========== Configuration ==========
 MODEL_ID = args.model.model_id or 'ms://Qwen/Qwen3.6-35B-A3B'
+GSM8K_DATASET_ID = args.dataset.dataset_id or 'ms://modelscope/gsm8k'
+# ``DatasetArgs.subset_name`` defaults to ``'default'``, which cannot distinguish
+# "unset" from an explicit ``'default'``. Resolve GSM8K's subset unambiguously: a
+# dedicated ``--gsm8k-subset`` (or ``TWINKLE_GSM8K_SUBSET``) knob is honored
+# verbatim, then an explicitly non-default ``--dataset-subset-name``, else
+# GSM8K's real subset ``'main'``.
+GSM8K_SUBSET = str(args.get('gsm8k_subset')
+                   or (args.dataset.subset_name if args.dataset.subset_name != 'default' else None) or 'main')
+GSM8K_SPLIT = args.dataset.split or 'train'
 
 MODEL_GPUS = args.infra.model_gpus or 4
 SAMPLER_GPUS = args.infra.sampler_gpus or 2
@@ -103,7 +116,7 @@ class GSM8KBrevityReward(Reward):
 
 # ========== Dataset ==========
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset = Dataset(DatasetMeta(GSM8K_DATASET_ID, subset_name=GSM8K_SUBSET, split=GSM8K_SPLIT))
     dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
@@ -126,8 +139,8 @@ def compute_rewards(
 def main():
     # Device groups: 8 GPUs for model (tp=2 x ep=2 x pp=2), 4 GPUs for sampler (dp=2 x tp=2)
     device_groups = [
-        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU',
+        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type=DEVICE_TYPE),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type=DEVICE_TYPE,
                     gpus_per_worker=SAMPLER_TP),
     ]
 
@@ -182,6 +195,8 @@ def main():
             'tensor_parallel_size': SAMPLER_TP,
             'gpu_memory_utilization': 0.8,
             'max_model_len': 8192,
+            # Ascend exhausts ACL-graph capture resources here; eager avoids it.
+            'enforce_eager': DEVICE_TYPE == 'NPU',
             'max_lora_rank': LORA_RANK,
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
             'enable_lora': True,

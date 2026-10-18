@@ -11,7 +11,7 @@ from typing import List, Tuple, Dict, Any
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.cli import CLI
@@ -32,6 +32,20 @@ args = CLI.from_args()
 # ========== Configuration ==========
 MODEL_ID = args.model.model_id or 'ms://Qwen/Qwen3.6-35B-A3B'
 USE_MEGATRON = args.model.strategy != 'native_fsdp'
+
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
+
+GSM8K_DATASET_ID = args.dataset.dataset_id or 'ms://modelscope/gsm8k'
+# ``DatasetArgs.subset_name`` defaults to ``'default'``, which cannot distinguish
+# "unset" from an explicit ``'default'``. Resolve GSM8K's subset unambiguously: a
+# dedicated ``--gsm8k-subset`` (or ``TWINKLE_GSM8K_SUBSET``) knob is honored
+# verbatim, then an explicitly non-default ``--dataset-subset-name``, else
+# GSM8K's real subset ``'main'``.
+GSM8K_SUBSET = str(args.get('gsm8k_subset')
+                   or (args.dataset.subset_name if args.dataset.subset_name != 'default' else None) or 'main')
+GSM8K_SPLIT = args.dataset.split or 'train'
 
 MODEL_GPUS = args.infra.model_gpus or 4
 MODEL_EP = args.infra.ep_size or 2
@@ -93,7 +107,7 @@ class GSM8KBrevityReward(Reward):
 
 # ========== Dataset ==========
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset = Dataset(DatasetMeta(GSM8K_DATASET_ID, subset_name=GSM8K_SUBSET, split=GSM8K_SPLIT))
     dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
@@ -115,17 +129,22 @@ def compute_rewards(
 # ========== Main ==========
 def main():
     device_groups = [
-        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU', gpus_per_worker=SAMPLER_TP),
+        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type=DEVICE_TYPE),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type=DEVICE_TYPE, gpus_per_worker=SAMPLER_TP),
     ]
-    dp_size = MODEL_GPUS //  (MODEL_TP * MODEL_PP)
-    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=dp_size, tp_size=MODEL_TP, pp_size=MODEL_PP, ep_size=MODEL_EP, sequence_parallel=True)
+    if USE_MEGATRON:
+        dp_size = MODEL_GPUS // (MODEL_TP * MODEL_PP)
+        model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=dp_size, tp_size=MODEL_TP,
+                                           pp_size=MODEL_PP, ep_size=MODEL_EP, sequence_parallel=True)
+    else:
+        # TransformersModel (native_fsdp) only shards across the DP/FSDP dim.
+        model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     sampler_dp_size = SAMPLER_GPUS //  (SAMPLER_TP)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=sampler_dp_size, tp_size=SAMPLER_TP)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
     lora_config = LoraConfig(
-        target_modules=['all-linear'],
+        target_modules='all-linear',
         r=LORA_RANK,
         lora_alpha=LORA_RANK * 2,
         lora_dropout=0.05,
@@ -144,6 +163,7 @@ def main():
             model_id=MODEL_ID,
             device_mesh=model_mesh,
             remote_group='model',
+            strategy=args.model.strategy,
         )
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
@@ -164,6 +184,8 @@ def main():
             'tensor_parallel_size': SAMPLER_TP,
             'gpu_memory_utilization': 0.7,
             'max_model_len': 10000,
+            # Ascend exhausts ACL-graph capture resources here; eager avoids it.
+            'enforce_eager': DEVICE_TYPE == 'NPU',
             'max_lora_rank': LORA_RANK, # save as lora_config
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
             # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
@@ -178,6 +200,14 @@ def main():
     sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
+    if DEVICE_TYPE == 'NPU':
+        # The sampler's vLLM engine already loaded the identical base model from
+        # the same checkpoint and the base is frozen under LoRA training, so the
+        # first full base-weight sync is redundant. Skipping it also avoids
+        # vLLM 0.30's fused 3D MoE expert loader (Qwen3.5 ``gate_up_proj`` /
+        # ``down_proj``), which mis-shapes when driven through manual
+        # ``model.load_weights`` under TP. Only the LoRA adapter is synced.
+        ckpt_manager.base_sync_done = True
 
     GLOBAL_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
     dataloader = DataLoader(

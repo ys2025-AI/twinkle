@@ -1964,7 +1964,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # ``enable_lora`` (``merge_and_sync=False``), rename base weights to
             # the ``.base_layer.`` form for every module vLLM has LoRA-wrapped
             # (detected via ``model_keys``); otherwise send canonical names.
-            add_base_layer = not merge_and_sync
+            # vLLM >= 0.30 expects canonical names again, so the suffix is
+            # version-gated.
+            from twinkle.utils.torch_utils import vllm_base_layer_suffix_required
+            add_base_layer = (not merge_and_sync) and vllm_base_layer_suffix_required()
+            # When embeddings are tied, ``lm_head.weight`` shares storage with
+            # ``embed_tokens``.  PeftModel.state_dict() materializes it, but the
+            # HF checkpoint omits it.  vLLM >= 0.30 checks skipped tied aliases
+            # against the checkpoint and raises if the tied target is absent, so
+            # drop the redundant alias and let tying re-initialize lm_head.
+            tie_embeddings = bool(getattr(self.hf_config, 'tie_word_embeddings', False))
             state_dict = model.state_dict()
 
             def weight_generator():
@@ -1974,6 +1983,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                         continue
                     tensor = Torch.to_local_tensor(tensor)
                     name = _normalize(name, keep_base_layer=False)
+                    if tie_embeddings and name == 'lm_head.weight':
+                        continue
                     if add_base_layer:
                         name = _add_base_layer_suffix(name)
                     names.append(name)

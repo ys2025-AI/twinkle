@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
+from twinkle import DeviceGroup, DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.cli import CLI
 from twinkle.data_format import Trajectory
 from twinkle.dataloader import DataLoader
@@ -59,6 +59,10 @@ from twinkle.processor import InputProcessor
 
 logger = get_logger()
 args = CLI.from_args()
+
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 USE_MEGATRON = args.model.strategy != 'native_fsdp'
@@ -130,7 +134,7 @@ def prepare_dpo_batch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def main():
     # Set up device groups - only one group for LoRA training
     device_groups = [
-        DeviceGroup(name='policy', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
+        DeviceGroup(name='policy', ranks=list(range(MODEL_GPUS)), device_type=DEVICE_TYPE),
     ]
 
     # Configure device mesh based on backend

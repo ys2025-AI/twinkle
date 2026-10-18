@@ -62,6 +62,28 @@ def test_copy_sampling_mask_rejects_invalid_csr(mask, num_tokens, message):
 
 def test_filter_engine_config_preserves_supported_replay_flag():
     filtered, invalid = _filter_engine_config(
+        {"dtype": "bfloat16", "return_sampling_mask": True, "unknown": 1},
+        {"dtype", "return_sampling_mask"},
+        enable_sampling_replay=True,
+    )
+
+    assert filtered == {"dtype": "bfloat16", "return_sampling_mask": True}
+    assert invalid == {"unknown"}
+
+
+def test_filter_engine_config_fails_fast_for_incompatible_vllm():
+    with pytest.raises(
+        RuntimeError, match="AsyncEngineArgs accepts return_sampling_mask"
+    ):
+        _filter_engine_config(
+            {"dtype": "bfloat16", "return_sampling_mask": True},
+            {"dtype"},
+            enable_sampling_replay=True,
+        )
+
+
+def test_filter_engine_config_accepts_legacy_replay_flag_name():
+    filtered, invalid = _filter_engine_config(
         {"dtype": "bfloat16", "enable_return_sampling_mask": True, "unknown": 1},
         {"dtype", "enable_return_sampling_mask"},
         enable_sampling_replay=True,
@@ -69,17 +91,6 @@ def test_filter_engine_config_preserves_supported_replay_flag():
 
     assert filtered == {"dtype": "bfloat16", "enable_return_sampling_mask": True}
     assert invalid == {"unknown"}
-
-
-def test_filter_engine_config_fails_fast_for_incompatible_vllm():
-    with pytest.raises(
-        RuntimeError, match="AsyncEngineArgs accepts enable_return_sampling_mask"
-    ):
-        _filter_engine_config(
-            {"dtype": "bfloat16", "enable_return_sampling_mask": True},
-            {"dtype"},
-            enable_sampling_replay=True,
-        )
 
 
 def test_replay_forces_final_only_output_kind(monkeypatch):

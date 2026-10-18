@@ -48,7 +48,7 @@ import os
 from typing import Any, Dict, List
 
 import twinkle
-from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
+from twinkle import DeviceGroup, DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.cli import CLI
 from twinkle.data_format import Trajectory
 from twinkle.dataloader import DataLoader
@@ -60,6 +60,10 @@ from twinkle.processor import InputProcessor
 
 logger = get_logger()
 args = CLI.from_args()
+
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 USE_MEGATRON = args.model.strategy != 'native_fsdp'
@@ -152,8 +156,8 @@ def create_loss(loss_type: str, beta: float, sft_weight: float = 0.0, reference_
 def main():
     # Set up device groups
     device_groups = [
-        DeviceGroup(name='policy', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-        DeviceGroup(name='reference', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU'),
+        DeviceGroup(name='policy', ranks=list(range(MODEL_GPUS)), device_type=DEVICE_TYPE),
+        DeviceGroup(name='reference', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type=DEVICE_TYPE),
     ]
 
     # Configure device mesh based on backend
@@ -163,12 +167,14 @@ def main():
         policy_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=2, pp_size=2)
         ref_mesh = DeviceMesh.from_sizes(world_size=REF_MODEL_GPUS, dp_size=4)
         ModelClass = MegatronModel
+        model_kwargs = {}
     else:
         # Transformers: fsdp=2, dp=2 for each model
         from twinkle.model import TransformersModel
         policy_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, fsdp_size=2, dp_size=2)
         ref_mesh = DeviceMesh.from_sizes(world_size=REF_MODEL_GPUS, dp_size=4)
         ModelClass = TransformersModel
+        model_kwargs = {'strategy': args.model.strategy}
 
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups)
 
@@ -185,6 +191,7 @@ def main():
         model_id=MODEL_ID,
         device_mesh=policy_mesh,
         remote_group='policy',
+        **model_kwargs,
     )
     MAX_STEPS = len(dataloader)
 
@@ -214,6 +221,7 @@ def main():
             model_id=MODEL_ID,
             device_mesh=ref_mesh,
             remote_group='reference',
+            **model_kwargs,
         )
         ref_model.set_processor(InputProcessor)
         ref_model.set_template('Template', model_id=MODEL_ID)

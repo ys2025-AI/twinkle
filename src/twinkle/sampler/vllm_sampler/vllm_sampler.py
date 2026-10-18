@@ -108,7 +108,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         # fix: On NPU, monkey_patch_model can trigger Triton compatibility errors and abort sampler init.
         # fix: Explicitly skip this patch on NPU and keep it for non-NPU paths only.
         # NPU platform may trigger triton errors with monkey_patch_model
-        self._run_in_loop(self.engine.engine.collective_rpc('monkey_patch_model'))
+        if Platform.get_platform().__name__ != 'NPU':
+            self._run_in_loop(self.engine.engine.collective_rpc('monkey_patch_model'))
 
         VLLMLoraWeights()(self)
 

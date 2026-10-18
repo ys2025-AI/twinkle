@@ -44,7 +44,7 @@ import torch
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
 from twinkle.cli import CLI
 from twinkle.data_format import SamplingParams
 from twinkle.dataloader import DataLoader
@@ -58,9 +58,22 @@ from twinkle.template import Template
 logger = get_logger()
 args = CLI.from_args()
 
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 STUDENT_MODEL_ID = args.rl.student_model_id or 'ms://Qwen/Qwen3-0.6B'
 TEACHER_MODEL_ID = args.rl.teacher_model_id or 'ms://Qwen/Qwen3-8B'
+GSM8K_DATASET_ID = args.dataset.dataset_id or 'ms://modelscope/gsm8k'
+# ``DatasetArgs.subset_name`` defaults to ``'default'``, which cannot distinguish
+# "unset" from an explicit ``'default'``. Resolve GSM8K's subset unambiguously: a
+# dedicated ``--gsm8k-subset`` (or ``TWINKLE_GSM8K_SUBSET``) knob is honored
+# verbatim, then an explicitly non-default ``--dataset-subset-name``, else
+# GSM8K's real subset ``'main'``.
+GSM8K_SUBSET = str(args.get('gsm8k_subset')
+                   or (args.dataset.subset_name if args.dataset.subset_name != 'default' else None) or 'main')
+GSM8K_SPLIT = args.dataset.split or 'train'
 
 MODEL_GPUS = args.infra.model_gpus or 4
 SAMPLER_GPUS = args.infra.sampler_gpus or 4
@@ -82,7 +95,7 @@ SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem step by st
 
 def create_dataset():
     """Full-text dataset with prompt + reference answer for off-policy distillation."""
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset = Dataset(DatasetMeta(GSM8K_DATASET_ID, subset_name=GSM8K_SUBSET, split=GSM8K_SPLIT))
     dataset.set_template('Template', model_id=STUDENT_MODEL_ID, max_length=1024)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT, add_assistant=True))
     return dataset
@@ -140,8 +153,8 @@ def convert_topk_prompt_logprobs(
 
 def main():
     device_groups = [
-        DeviceGroup(name='student_model', ranks=MODEL_GPUS, device_type='cuda'),
-        DeviceGroup(name='teacher_sampler', ranks=SAMPLER_GPUS, device_type='cuda'),
+        DeviceGroup(name='student_model', ranks=MODEL_GPUS, device_type=DEVICE_TYPE),
+        DeviceGroup(name='teacher_sampler', ranks=SAMPLER_GPUS, device_type=DEVICE_TYPE),
     ]
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)

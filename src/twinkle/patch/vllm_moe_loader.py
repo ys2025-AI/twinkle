@@ -3,6 +3,8 @@
 # reference from https://github.com/volcengine/verl/blob/main/verl/utils/vllm/patch.py
 # To support different vLLM versions, we add the model into SUPPORTED_MOE_MODELS separately to avoid triggering
 # unsupported issues.
+import os
+
 from .base import Patch
 
 SUPPORTED_MOE_MODELS = []
@@ -59,6 +61,16 @@ except ImportError:
 
 
 def patch_qwen35_moe_is_3d_moe_weight_false() -> None:
+    """Force Qwen3.5 MoE ``is_3d_moe_weight=False`` so vLLM expects 2D per-expert
+    LoRA module names (``up_proj`` -> ``experts.0.up_proj``).
+
+    Adapters trained on the 3D fused expert params instead (PEFT
+    ``target_parameters`` such as ``mlp.experts.gate_up_proj`` /
+    ``mlp.experts.down_proj``) require vLLM to keep its default 3D layout. Set
+    ``TWINKLE_QWEN35_MOE_IS_3D_WEIGHT=1`` to skip this patch.
+    """
+    if os.environ.get('TWINKLE_QWEN35_MOE_IS_3D_WEIGHT', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        return
     # expected_lora_modules : up_proj -> experts.0.up_proj
     try:
         from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration

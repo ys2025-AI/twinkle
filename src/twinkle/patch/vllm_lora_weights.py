@@ -94,8 +94,13 @@ class VLLMLoraWeights(Patch):
                 # (align with vllm.lora.worker_manager.WorkerLoRAManager._load_adapter)
                 model = self._adapter_manager.model
                 hf_to_vllm_mapper = getattr(model, 'hf_to_vllm_mapper', None)
-                if hf_to_vllm_mapper is not None and hasattr(hf_to_vllm_mapper, 'get_unstacked_mapper'):
-                    hf_to_vllm_mapper = hf_to_vllm_mapper.get_unstacked_mapper()
+                if hf_to_vllm_mapper is not None:
+                    # vLLM >= 0.30 renamed ``get_unstacked_mapper`` to
+                    # ``get_rename_mapper`` (skip stacking/deletions, keep renames).
+                    if hasattr(hf_to_vllm_mapper, 'get_rename_mapper'):
+                        hf_to_vllm_mapper = hf_to_vllm_mapper.get_rename_mapper()
+                    elif hasattr(hf_to_vllm_mapper, 'get_unstacked_mapper'):
+                        hf_to_vllm_mapper = hf_to_vllm_mapper.get_unstacked_mapper()
 
                 lora_request_kwargs = {
                     'peft_helper': peft_helper,
@@ -151,7 +156,12 @@ class VLLMLoraWeights(Patch):
             wrapped = _wrapped_tok_cache.get(key)
             if wrapped is None:
                 try:
-                    from vllm.transformers_utils.tokenizer import get_cached_tokenizer
+                    # vLLM >= 0.30 moved this helper to ``vllm.tokenizers.hf``;
+                    # older builds exposed it under ``vllm.transformers_utils.tokenizer``.
+                    try:
+                        from vllm.tokenizers.hf import get_cached_tokenizer
+                    except ImportError:
+                        from vllm.transformers_utils.tokenizer import get_cached_tokenizer
                     wrapped = get_cached_tokenizer(tokenizer)
                 except Exception:
                     wrapped = tokenizer

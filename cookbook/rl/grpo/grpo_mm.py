@@ -11,7 +11,7 @@ from typing import List, Tuple, Dict, Any
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.cli import CLI
@@ -30,6 +30,10 @@ from twinkle.sampler import vLLMSampler
 
 logger = get_logger()
 args = CLI.from_args()
+
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
 
 # Model configuration
 MODEL_ID = args.model.model_id or 'ms://Qwen/Qwen3.5-4B'
@@ -126,8 +130,8 @@ def compute_rewards(
 def main():
     # Device groups: model and sampler on separate GPUs
     device_groups = [
-        DeviceGroup(name='model', ranks=MODEL_GPUS, device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=SAMPLER_GPUS, device_type='GPU'),
+        DeviceGroup(name='model', ranks=MODEL_GPUS, device_type=DEVICE_TYPE),
+        DeviceGroup(name='sampler', ranks=SAMPLER_GPUS, device_type=DEVICE_TYPE),
     ]
 
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
@@ -136,7 +140,7 @@ def main():
 
     # LoRA configuration
     lora_config = LoraConfig(
-        target_modules=['all-linear'], # including ViT and Merger/Connector
+        target_modules='all-linear',  # including ViT and Merger/Connector
         r=16,
         lora_alpha=32,
         lora_dropout=0.05,
@@ -157,6 +161,7 @@ def main():
             model_cls=Qwen3_5ForConditionalGeneration,
             device_mesh=model_mesh,
             remote_group='model',
+            strategy=args.model.strategy,
         )
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)

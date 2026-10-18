@@ -30,7 +30,7 @@ from peft import LoraConfig
 
 import swanlab
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.cli import CLI
@@ -48,6 +48,10 @@ from twinkle_agentic.utils.message_utils import assistant_text
 
 logger = get_logger()
 args = CLI.from_args()
+
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
 
 swanlab.init(project='twinkle')
 
@@ -348,8 +352,8 @@ def compute_rewards(
 # ========== Main ==========
 def main():
     device_groups = [
-        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU'),
+        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type=DEVICE_TYPE),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type=DEVICE_TYPE),
     ]
 
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
@@ -377,6 +381,7 @@ def main():
             model_id=MODEL_ID,
             device_mesh=model_mesh,
             remote_group='model',
+            strategy=args.model.strategy,
         )
 
     model.add_adapter_to_model('default', lora_config,

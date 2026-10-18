@@ -1676,7 +1676,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 # ``enable_lora`` (``merge_and_sync=False``).  ``_add_base_layer_suffix``
                 # self-guards via ``model_keys``, so it only renames params vLLM
                 # actually exposes as ``*WithLoRA`` and is a no-op for full-param.
-                if not merge_and_sync:
+                # vLLM >= 0.30 expects canonical names again, so gate on version.
+                from twinkle.utils.torch_utils import vllm_base_layer_suffix_required
+                if not merge_and_sync and vllm_base_layer_suffix_required():
                     yield from _raw_weights(True)
                 else:
                     yield from _raw_weights(False)

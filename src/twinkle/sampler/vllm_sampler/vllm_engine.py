@@ -31,6 +31,19 @@ def _map_finish_reason(reason: str | None) -> StopReason:
     return _FINISH_REASON_MAP.get(str(reason), 'length')
 
 
+# vLLM >= 0.30 names the sampling-replay flag ``return_sampling_mask``; older or
+# custom builds may only accept the historical ``enable_return_sampling_mask``.
+_REPLAY_FLAG_CANDIDATES = ('return_sampling_mask', 'enable_return_sampling_mask')
+
+
+def _resolve_replay_flag(valid_args) -> Optional[str]:
+    valid_args = set(valid_args)
+    for name in _REPLAY_FLAG_CANDIDATES:
+        if name in valid_args:
+            return name
+    return None
+
+
 def _filter_engine_config(
     engine_config: Dict[str, Any],
     valid_args,
@@ -38,9 +51,9 @@ def _filter_engine_config(
 ):
     valid_args = set(valid_args)
     invalid_args = set(engine_config) - valid_args
-    if enable_sampling_replay and 'enable_return_sampling_mask' in invalid_args:
+    if enable_sampling_replay and _resolve_replay_flag(valid_args) is None:
         raise RuntimeError('Sampling replay requires a vLLM build whose AsyncEngineArgs accepts '
-                           'enable_return_sampling_mask')
+                           'return_sampling_mask (or enable_return_sampling_mask)')
     filtered_engine_config = {key: value for key, value in engine_config.items() if key in valid_args}
     return filtered_engine_config, invalid_args
 
@@ -276,6 +289,10 @@ class VLLMEngine(BaseSamplerEngine):
         self._ipc_handle: Any = None
         self._ipc_buffer_size: int = 0
 
+        # Track the last sleep level so wake_up can warn if the "weights" tag is
+        # omitted (which would leave the model without weights and hang).
+        self._last_sleep_level: Optional[int] = None
+
         # Initialize engine
         self.engine = self._create_engine()
 
@@ -285,7 +302,9 @@ class VLLMEngine(BaseSamplerEngine):
     def _create_engine(self):
         """Create and return the vLLM engine."""
         os.environ['VLLM_USE_V1'] = '1'
-        if self.enable_sampling_replay:
+        # Both sampling-distribution replay and routed-experts capture (router
+        # replay R3) are only implemented by the V2 model runner.
+        if self.enable_sampling_replay or self.engine_kwargs.get('enable_return_routed_experts'):
             os.environ['VLLM_USE_V2_MODEL_RUNNER'] = '1'
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext
@@ -332,10 +351,34 @@ class VLLMEngine(BaseSamplerEngine):
             'twinkle.sampler.vllm_sampler.vllm_worker_extension.TwinkleWorkerExtension')
 
         engine_config.update(self.engine_kwargs)
-        if self.enable_sampling_replay:
-            engine_config['enable_return_sampling_mask'] = True
-            engine_config['logprobs_mode'] = 'processed_logprobs'
         valid_args = inspect.signature(AsyncEngineArgs).parameters.keys()
+
+        # vllm-ascend keeps weights in FRACTAL_NZ format by default, which is
+        # rejected by ``wake_up`` (and is unsafe for RL weight updates) unless
+        # NZ is disabled. Enabling ``additional_config.rl_config`` turns NZ off
+        # and applies the other Ascend RL defaults. Users can override by
+        # passing their own ``additional_config`` in ``engine_args``.
+        if Platform.get_platform().__name__ == 'NPU':
+            additional_config = dict(engine_config.get('additional_config') or {})
+            rl_config = dict(additional_config.get('rl_config') or {})
+            rl_config.setdefault('enabled', True)
+            additional_config['rl_config'] = rl_config
+            engine_config['additional_config'] = additional_config
+            if rl_config.get('enabled') is False:
+                logger.warning('NPU: vllm-ascend RL scenarios (weight update / sleep-wake) require '
+                               'additional_config.rl_config.enabled=True (or weight_nz_mode=0); it was '
+                               'explicitly disabled, so wake_up may fail with a FRACTAL_NZ error.')
+
+        if self.enable_sampling_replay:
+            # Set whichever sampling-replay flag the installed vLLM declares
+            # (``return_sampling_mask`` in >= 0.30, ``enable_return_sampling_mask``
+            # in older/custom builds); fail fast if neither is supported.
+            replay_flag = _resolve_replay_flag(valid_args)
+            if replay_flag is None:
+                raise RuntimeError('Sampling replay requires a vLLM build whose AsyncEngineArgs accepts '
+                                   'return_sampling_mask (or enable_return_sampling_mask)')
+            engine_config[replay_flag] = True
+            engine_config['logprobs_mode'] = 'processed_logprobs'
         filtered_engine_config, invalid_args = _filter_engine_config(
             engine_config,
             valid_args,
@@ -715,15 +758,17 @@ class VLLMEngine(BaseSamplerEngine):
         Used in colocated mode to free GPU memory for training.
 
         Args:
-            level: Sleep level.
-                1 = offload KV cache only
-                2 = offload KV cache and weights
+            level: Sleep level (matches vLLM / vllm-ascend semantics; note this is
+                the reverse of a naive "1 = KV cache only" reading):
+                1 = offload model weights only (KV cache kept resident)
+                2 = offload model weights and KV cache
         """
         if not self.enable_sleep_mode:
             logger.warning('sleep_mode not enabled, skipping sleep')
             return
 
         await self.engine.sleep(level=level)
+        self._last_sleep_level = level
         logger.debug(f'Engine sleeping at level {level}')
 
     async def wake_up(self, tags: Optional[List[str]] = None) -> None:
@@ -746,7 +791,18 @@ class VLLMEngine(BaseSamplerEngine):
         if tags is None:
             tags = ['weights', 'kv_cache']
 
+        # ``sleep(level>=1)`` offloads the model weights; restoring only
+        # ``kv_cache`` leaves the model without weights and sampling will hang.
+        # Warn early instead of hanging.
+        if 'weights' not in tags and self._last_sleep_level is not None:
+            logger.warning(
+                'wake_up called without the "weights" tag but a level-%s sleep '
+                'offloaded the model weights; sampling will hang. Pass tags=None '
+                'to restore both weights and kv_cache.', self._last_sleep_level)
+
         await self.engine.wake_up(tags=tags)
+        if 'weights' in tags:
+            self._last_sleep_level = None
 
         logger.debug(f'Engine waking up with tags: {tags}')
 
@@ -1052,13 +1108,19 @@ class VLLMEngine(BaseSamplerEngine):
 
         if self.engine is not None:
             try:
-                # vLLM v1 AsyncLLM has shutdown() method
+                # vLLM v1 AsyncLLM has shutdown() method. In vLLM >= 0.30 it is
+                # synchronous (it was async in some earlier builds), so handle
+                # both by awaiting only when the call returns an awaitable.
                 if hasattr(self.engine, 'shutdown'):
-                    await self.engine.shutdown()
+                    shutdown_result = self.engine.shutdown()
+                    if inspect.isawaitable(shutdown_result):
+                        await shutdown_result
                 elif hasattr(self.engine, 'engine_core'):
                     # For older versions, try to stop engine core
                     if hasattr(self.engine.engine_core, 'shutdown'):
-                        await self.engine.engine_core.shutdown()
+                        core_result = self.engine.engine_core.shutdown()
+                        if inspect.isawaitable(core_result):
+                            await core_result
             except Exception as e:
                 logger.warning(f'Error during engine shutdown: {e}')
             finally:

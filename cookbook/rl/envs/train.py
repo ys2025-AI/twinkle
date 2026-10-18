@@ -7,7 +7,7 @@ import torch
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
+from twinkle import DeviceGroup, DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.cli import CLI
@@ -23,6 +23,10 @@ from twinkle_agentic.tools.tool_manager import ToolManager
 
 logger = get_logger()
 args = CLI.from_args()
+
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
 
 # ========== Backend selection ==========
 BACKENDS = ('openenv', 'agentenv')
@@ -141,8 +145,8 @@ def extract_rewards(
 # ========== Main ==========
 def main():
     device_groups = [
-        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU'),
+        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type=DEVICE_TYPE),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type=DEVICE_TYPE),
     ]
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
@@ -159,6 +163,7 @@ def main():
         model_id=MODEL_ID,
         device_mesh=model_mesh,
         remote_group='model',
+        strategy=args.model.strategy,
         dtype=torch.float32,
         mixed_precision='bf16',
     )

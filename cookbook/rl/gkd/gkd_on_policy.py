@@ -49,7 +49,7 @@ import torch
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.cli import CLI
 from twinkle.data_format import SamplingParams
@@ -62,6 +62,10 @@ from twinkle.sampler import vLLMSampler
 
 logger = get_logger()
 args = CLI.from_args()
+
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 STUDENT_MODEL_ID = args.rl.student_model_id or 'ms://Qwen/Qwen3.5-4B'
@@ -161,9 +165,9 @@ def convert_topk_prompt_logprobs(
 
 def main():
     device_groups = [
-        DeviceGroup(name='student_model', ranks=MODEL_GPUS, device_type='cuda'),
-        DeviceGroup(name='student_sampler', ranks=SAMPLER_GPUS, device_type='cuda'),
-        DeviceGroup(name='teacher_sampler', ranks=SAMPLER_GPUS, device_type='cuda'),
+        DeviceGroup(name='student_model', ranks=MODEL_GPUS, device_type=DEVICE_TYPE),
+        DeviceGroup(name='student_sampler', ranks=SAMPLER_GPUS, device_type=DEVICE_TYPE),
+        DeviceGroup(name='teacher_sampler', ranks=SAMPLER_GPUS, device_type=DEVICE_TYPE),
     ]
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
@@ -191,6 +195,7 @@ def main():
             model_cls=Qwen3_5ForConditionalGeneration,
             device_mesh=model_mesh,
             remote_group='student_model',
+            strategy=args.model.strategy,
         )
 
     student_model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)

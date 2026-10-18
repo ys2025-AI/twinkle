@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Tuple
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
+from twinkle import DeviceGroup, DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.advantage import GAEAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.cli import CLI
@@ -27,7 +27,20 @@ from twinkle.sampler import vLLMSampler
 logger = get_logger()
 args = CLI.from_args()
 
+# Device backend is derived from the runtime platform so the same cookbook runs
+# on CUDA GPUs and Ascend NPUs.
+DEVICE_TYPE = Platform.get_platform().__name__
+
 MODEL_ID = args.model.model_id or 'ms://Qwen/Qwen3.5-4B'
+GSM8K_DATASET_ID = args.dataset.dataset_id or 'ms://modelscope/gsm8k'
+# ``DatasetArgs.subset_name`` defaults to ``'default'``, which cannot distinguish
+# "unset" from an explicit ``'default'``. Resolve GSM8K's subset unambiguously: a
+# dedicated ``--gsm8k-subset`` (or ``TWINKLE_GSM8K_SUBSET``) knob is honored
+# verbatim, then an explicitly non-default ``--dataset-subset-name``, else
+# GSM8K's real subset ``'main'``.
+GSM8K_SUBSET = str(args.get('gsm8k_subset')
+                   or (args.dataset.subset_name if args.dataset.subset_name != 'default' else None) or 'main')
+GSM8K_SPLIT = args.dataset.split or 'train'
 POLICY_GPUS = args.infra.model_gpus or 4
 CRITIC_GPUS = args.infra.critic_model_gpus or 4
 SAMPLER_GPUS = args.infra.sampler_gpus or 4
@@ -48,7 +61,7 @@ ADAPTER_NAME = args.lora.adapter_name or 'default'
 
 
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset = Dataset(DatasetMeta(GSM8K_DATASET_ID, subset_name=GSM8K_SUBSET, split=GSM8K_SPLIT))
     dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=400)
     dataset.map(GSM8KProcessor())
     dataset.encode(add_generation_prompt=True)
@@ -88,9 +101,9 @@ def main():
     critic_start = POLICY_GPUS
     sampler_start = POLICY_GPUS + CRITIC_GPUS
     groups = [
-        DeviceGroup(name='policy', ranks=list(range(POLICY_GPUS)), device_type='GPU'),
-        DeviceGroup(name='critic', ranks=list(range(critic_start, sampler_start)), device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=list(range(sampler_start, NUM_GPUS)), device_type='GPU'),
+        DeviceGroup(name='policy', ranks=list(range(POLICY_GPUS)), device_type=DEVICE_TYPE),
+        DeviceGroup(name='critic', ranks=list(range(critic_start, sampler_start)), device_type=DEVICE_TYPE),
+        DeviceGroup(name='sampler', ranks=list(range(sampler_start, NUM_GPUS)), device_type=DEVICE_TYPE),
     ]
     policy_mesh = DeviceMesh.from_sizes(world_size=POLICY_GPUS, fsdp_size=POLICY_GPUS)
     critic_mesh = DeviceMesh.from_sizes(world_size=CRITIC_GPUS, fsdp_size=CRITIC_GPUS)
@@ -98,7 +111,11 @@ def main():
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=groups, lazy_collect=False)
 
     policy = TransformersModel(
-        model_id=MODEL_ID, device_mesh=policy_mesh, remote_group='policy')
+        model_id=MODEL_ID,
+        device_mesh=policy_mesh,
+        remote_group='policy',
+        strategy=args.model.strategy,
+    )
     lora_config = LoraConfig(
         target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'],
         r=32,
@@ -119,7 +136,11 @@ def main():
     policy.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     critic = TransformersValueModel(
-        model_id=MODEL_ID, device_mesh=critic_mesh, remote_group='critic')
+        model_id=MODEL_ID,
+        device_mesh=critic_mesh,
+        remote_group='critic',
+        strategy=args.model.strategy,
+    )
     critic.set_optimizer('AdamW', lr=CRITIC_LR)
     critic.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
     critic.set_loss('PPOValueLoss', epsilon=args.loss.value_clip)
